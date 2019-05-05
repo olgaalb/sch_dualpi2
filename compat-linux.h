@@ -4,7 +4,7 @@
 #include "compat-pkt_sched.h"
 
 #ifdef IS_TESTBED
-#include "../common/testbed.h" /* only used for testbed */
+#include "testbed.h" /* only used for testbed */
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)

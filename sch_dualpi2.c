@@ -49,13 +49,15 @@
 #include <net/pkt_sched.h>
 #include <net/inet_ecn.h>
 #include <net/dsfield.h>
+#include <linux/string.h>
 #include "compat-linux.h"
 
 #define MAX_PROB  0xffffffff
+#define ALPHA_BETA_MAX 10240000
 
 /* parameters used */
 struct dualpi2_params {
-	psched_time_t	target;	/* user specified target delay in pschedtime */
+	u64	target;		/* user specified target delay in nanoseconds */
 	u64	tshift;		/* L4S FIFO time shift (in ns) */
 	u32	tupdate;	/* timer frequency (in jiffies) */
 	u32	limit;		/* number of packets that can be enqueued */
@@ -96,14 +98,14 @@ struct dualpi2_params {
 
 /* variables used */
 struct dualpi2_vars {
-	psched_time_t	qdelay_c;		/* Classic Q delay */
-	psched_time_t	qdelay_l;		/* L4S Q delay */
-	u32		prob;			/* probability scaled as u32 */
-	u32		alpha;			/* calculated alpha value */
-	u32		beta;			/* calculated beta value */
-	u32		deferred_drop_count;
-	u32		deferred_drop_len;
-	u32		dequeued_l;		/* Successive L4S dequeues */
+	u64	qdelay_c;		/* Classic Q delay */
+	u64	qdelay_l;		/* L4S Q delay */
+	u32	prob;			/* probability scaled as u32 */
+	u32	alpha;			/* calculated alpha value */
+	u32	beta;			/* calculated beta value */
+	u32	deferred_drop_count;
+	u32	deferred_drop_len;
+	u32	dequeued_l;		/* Successive L4S dequeues */
 };
 
 /* statistics gathering */
@@ -130,14 +132,27 @@ struct dualpi2_sched_data {
 #endif
 };
 
+static inline void set_ts_cb(struct sk_buff *skb)
+{
+        u64 now = ktime_get_ns();
+        memcpy(qdisc_skb_cb(skb)->data, &now, sizeof(u64));
+}
+
+static inline u64 get_ts_cb(struct sk_buff *skb)
+{
+        u64 ts = 0;
+        memcpy(&ts, qdisc_skb_cb(skb)->data, sizeof(u64));
+	return ts;
+}
+
 static inline u64 skb_sojourn_time(struct sk_buff *skb, u64 reference)
 {
-	return skb ? reference - ktime_to_ns(skb_get_ktime(skb)) : 0;
+        return skb ? reference - get_ts_cb(skb) : 0;
 }
 
 static inline u32 __dualpi2_vars_from_params(u32 param)
 {
-	return (param * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 8;
+	return (param * (MAX_PROB / NSEC_PER_SEC)) >> 8;
 }
 
 static void dualpi2_calculate_alpha_beta(struct dualpi2_sched_data *q)
@@ -153,7 +168,7 @@ static void dualpi2_params_init(struct dualpi2_params *params)
 	params->beta = 800;
 	params->tupdate = usecs_to_jiffies(32 * USEC_PER_MSEC);	/* 32 ms */
 	params->limit = 10000;
-	params->target = PSCHED_NS2TICKS(20 * NSEC_PER_MSEC);	/* 20 ms */
+	params->target = 20 * NSEC_PER_MSEC;	/* 20 ms */
 	params->k = 2;
 	params->queue_mask = INET_ECN_ECT_1;
 	params->mark_mask = INET_ECN_MASK;
@@ -169,10 +184,10 @@ static void dualpi2_params_init(struct dualpi2_params *params)
 
 static u32 get_ecn_field(struct sk_buff *skb)
 {
-	switch (skb->protocol) {
-	case cpu_to_be16(ETH_P_IP):
+	switch (tc_skb_protocol(skb)) {
+	case htons(ETH_P_IP):
 		return ipv4_get_dsfield(ip_hdr(skb)) & INET_ECN_MASK;
-	case cpu_to_be16(ETH_P_IPV6):
+	case htons(ETH_P_IPV6):
 		return ipv6_get_dsfield(ipv6_hdr(skb)) & INET_ECN_MASK;
 	default:
 		return 0;
@@ -230,9 +245,6 @@ static int dualpi2_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	u32 ecn = get_ecn_field(skb);
 	int err;
 
-	/* set to the time the HTQ packet is in the Q */
-	__net_timestamp(skb);
-
 	if (unlikely(qdisc_qlen(sch) >= sch->limit)) {
 		qdisc_qstats_overlimit(sch);
 		err = NET_XMIT_DROP;
@@ -244,6 +256,9 @@ static int dualpi2_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		err = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
 		goto drop;
 	}
+
+	/* set to the time the HTQ packet is in the Q */
+        set_ts_cb(skb);
 
 	q->stats.packets_in++;
 	if (qdisc_qlen(sch) > q->stats.maxq)
@@ -329,9 +344,9 @@ static int dualpi2_change(struct Qdisc *sch, struct nlattr *opt,
 	}
 
 	if (tb[TCA_DUALPI2_TARGET]) {
-		u32 target = nla_get_u32(tb[TCA_DUALPI2_TARGET]);
+		u64 target = nla_get_u64(tb[TCA_DUALPI2_TARGET]);
 
-		q->params.target = PSCHED_NS2TICKS((u64)target * NSEC_PER_USEC);
+		q->params.target = target * NSEC_PER_USEC;
 	}
 
 	if (tb[TCA_DUALPI2_TUPDATE]) {
@@ -347,11 +362,17 @@ static int dualpi2_change(struct Qdisc *sch, struct nlattr *opt,
 		sch->limit = limit;
 	}
 
-	if (tb[TCA_DUALPI2_ALPHA])
+	if (tb[TCA_DUALPI2_ALPHA]) {
 		q->params.alpha = nla_get_u32(tb[TCA_DUALPI2_ALPHA]);
+		if (q->params.alpha > ALPHA_BETA_MAX)
+			q->params.alpha = ALPHA_BETA_MAX;
+	}
 
-	if (tb[TCA_DUALPI2_BETA])
+	if (tb[TCA_DUALPI2_BETA]) {
 		q->params.beta = nla_get_u32(tb[TCA_DUALPI2_BETA]);
+		if (q->params.beta > ALPHA_BETA_MAX)
+                        q->params.beta = ALPHA_BETA_MAX;
+	}
 
 	if (tb[TCA_DUALPI2_DUALQ])
 		q->params.queue_mask = nla_get_u32(tb[TCA_DUALPI2_DUALQ]);
@@ -424,25 +445,25 @@ static int dualpi2_change(struct Qdisc *sch, struct nlattr *opt,
 	return 0;
 }
 
-static inline psched_time_t qdelay_in_psched(struct Qdisc *q, u64 now)
+static inline u64 qdelay_in_ns(struct Qdisc *q, u64 now)
 {
 	struct sk_buff *skb = qdisc_peek_head(q);
-	return PSCHED_NS2TICKS(skb_sojourn_time(skb, now));
+	return skb_sojourn_time(skb, now);
 }
 
 static void calculate_probability(struct Qdisc *sch)
 {
 	struct dualpi2_sched_data *q = qdisc_priv(sch);
-	u64 now = ktime_get_real_ns();
-	psched_time_t qdelay_old;
-	psched_time_t qdelay;
+	u64 now = ktime_get_ns();
+	u64 qdelay_old;
+	u64 qdelay;
 	u32 oldprob;
 	s64 delta;	/* determines the change in probability */
 
 	qdelay_old = max(q->vars.qdelay_c, q->vars.qdelay_l);
 
-	q->vars.qdelay_l = qdelay_in_psched(q->l_queue, now);
-	q->vars.qdelay_c = qdelay_in_psched(sch, now);
+	q->vars.qdelay_l = qdelay_in_ns(q->l_queue, now);
+	q->vars.qdelay_c = qdelay_in_ns(sch, now);
 
 	qdelay = max(q->vars.qdelay_c, q->vars.qdelay_l);
 
@@ -537,13 +558,22 @@ static int dualpi2_dump(struct Qdisc *sch, struct sk_buff *skb)
 	struct nlattr *opts = nla_nest_start(skb, TCA_OPTIONS);
 	struct dualpi2_sched_data *q = qdisc_priv(sch);
 
+	u64 target_usec = q->params.target;
+        u64 tshift_usec = q->params.tshift;
+
+        do_div(target_usec, NSEC_PER_USEC);
+        do_div(tshift_usec, NSEC_PER_USEC);
+
 	if (!opts)
 		goto nla_put_failure;
 
-	/* convert target from pschedtime to us */
-	if (nla_put_u32(skb, TCA_DUALPI2_TARGET,
-			((u32)PSCHED_TICKS2NS(q->params.target)) /
-			NSEC_PER_USEC) ||
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 7, 0)
+	if (nla_put_u64(skb, TCA_DUALPI2_TARGET,
+                        target_usec) ||
+#else
+	if (nla_put_u64_64bit(skb, TCA_DUALPI2_TARGET,
+			target_usec, TCA_DUALPI2_PAD) ||
+#endif
 	    nla_put_u32(skb, TCA_DUALPI2_LIMIT, sch->limit) ||
 	    nla_put_u32(skb, TCA_DUALPI2_TUPDATE,
 			jiffies_to_usecs(q->params.tupdate)) ||
@@ -556,7 +586,7 @@ static int dualpi2_dump(struct Qdisc *sch, struct sk_buff *skb)
 	    nla_put_u32(skb, TCA_DUALPI2_ET_PACKETS, q->params.et_packets) ||
 	    nla_put_u32(skb, TCA_DUALPI2_L_THRESH, q->params.ecn_thresh) ||
 	    nla_put_u32(skb, TCA_DUALPI2_T_SHIFT,
-			((u32)(q->params.tshift / NSEC_PER_USEC))) ||
+			tshift_usec) ||
 	    nla_put_u16(skb, TCA_DUALPI2_T_SPEED, q->params.tspeed) ||
 	    /* put before L_DROP because we are inside a multiline expression */
 	    nla_put_u32(skb, TCA_DUALPI2_DROP_EARLY, q->params.drop_early) ||
@@ -575,12 +605,16 @@ nla_put_failure:
 static int dualpi2_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
 {
 	struct dualpi2_sched_data *q = qdisc_priv(sch);
+	u64 qdelay_c_usec = q->vars.qdelay_c;
+        u64 qdelay_l_usec = q->vars.qdelay_l;
+
+        do_div(qdelay_c_usec, NSEC_PER_USEC);
+        do_div(qdelay_l_usec, NSEC_PER_USEC);
+
 	struct tc_dualpi2_xstats st = {
 		.prob		= q->vars.prob,
-		.delay_c	= ((u32)PSCHED_TICKS2NS(q->vars.qdelay_c)) /
-				   NSEC_PER_USEC,
-		.delay_l	= ((u32)PSCHED_TICKS2NS(q->vars.qdelay_l)) /
-				   NSEC_PER_USEC,
+                .delay_c        = qdelay_c_usec,
+                .delay_l        = qdelay_l_usec,
 		.packets_in	= q->stats.packets_in,
 		.overlimit	= q->stats.overlimit,
 		.maxq		= q->stats.maxq,
@@ -603,7 +637,7 @@ pick_packet:
 	skb_l = qdisc_peek_head(q->l_queue);
 	skb_c = qdisc_peek_head(sch);
 	skb = NULL;
-	now = ktime_get_real_ns();
+	now = ktime_get_ns();
 	qdelay_l = skb_sojourn_time(skb_l, now);
 	qdelay_c = skb_sojourn_time(skb_c, now);
 
