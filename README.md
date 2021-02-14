@@ -1,3 +1,9 @@
+## Archived ##
+
+This repository contains a historical archive of the DualPI2 code.
+
+See https://github.com/L4STeam for newer work.
+
 # README #
 
 ### What is this repository for? ###
