@@ -1,6 +1,6 @@
 ## Archived ##
 
-This repository contains an historical archive of the DualPI2 code.
+This repository contains a historical archive of the DualPI2 code.
 
 See https://github.com/L4STeam for newer work.
 
